@@ -7,22 +7,42 @@ const cheerio = require('cheerio');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
 const app = express();
-app.use(express.json()); // To parse JSON bodies
-app.use(express.static('public')); // Serve our frontend UI
+app.use(express.json()); 
+// THIS IS THE FIX: Locks the public folder path securely
+app.use(express.static(path.join(__dirname, 'public')));
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
 const SERPAPI_KEY = process.env.SERPAPI_KEY;
 
-// --- Helper Functions (From previous script) ---
+// --- Helper Functions ---
 async function getTargetLeads(location, industry) {
     const query = `${industry} in ${location}`;
     const url = `https://serpapi.com/search.json?engine=google_local&q=${encodeURIComponent(query)}&api_key=${SERPAPI_KEY}`;
+    
+    console.log(`🔍 Searching for: "${query}"`);
+    console.log(`📡 SERPAPI_KEY defined: ${!!SERPAPI_KEY}`);
+    
     try {
-        const response = await fetch(url);
-        const data = await response.json();
-        if (!data.local_results) return [];
-        return data.local_results.filter(biz => biz.reviews && biz.reviews >= 30 && biz.reviews <= 400 && biz.website);
-    } catch (error) { return []; }
+        // THIS IS THE FIX: Using Axios instead of native fetch for better stability
+        const response = await axios.get(url);
+        const data = response.data;
+        
+        console.log(`✅ SerpAPI Response status: Success`);
+        console.log(`📊 Local results found: ${data.local_results ? data.local_results.length : 0}`);
+        
+        if (!data.local_results) {
+            console.log(`⚠️ No local_results in response. Full response keys:`, Object.keys(data));
+            return [];
+        }
+        
+        const filtered = data.local_results.filter(biz => biz.reviews && biz.reviews >= 30 && biz.reviews <= 400 && biz.website);
+        console.log(`✅ Filtered results (30-400 reviews): ${filtered.length}`);
+        return filtered;
+    } catch (error) { 
+        console.error("❌ SerpApi Error:", error.message);
+        console.error("Error response:", error.response?.data || "No response data");
+        return []; 
+    }
 }
 
 async function scrapeWebsiteData(url) {
@@ -56,6 +76,8 @@ async function generateAgencyPitch(businessName, websiteText) {
 app.post('/api/generate-leads', async (req, res) => {
     const { location, industry } = req.body;
     
+    console.log(`\n🚀 API Request: location="${location}", industry="${industry}"`);
+    
     // Security/Validation: Prevent targeting UK agency's restricted regions
     const restrictedRegions = ['bangladesh', 'bd', 'india', 'in'];
     if (restrictedRegions.some(region => location.toLowerCase().includes(region))) {
@@ -68,7 +90,13 @@ app.post('/api/generate-leads', async (req, res) => {
     fs.writeFileSync(outputFilePath, '"Business Name","Phone","Email","Website","Reviews","Vibe","Pitch Angle","Icebreaker"\n');
 
     const leads = await getTargetLeads(location, industry);
-    if (leads.length === 0) return res.status(404).json({ error: "No leads found in this area." });
+    
+    console.log(`📋 Total leads returned from SerpAPI: ${leads.length}`);
+    
+    if (leads.length === 0) {
+        console.log(`⚠️ No leads found after filtering`);
+        return res.status(404).json({ error: "No leads found in this area." });
+    }
 
     const seenBrands = new Set();
     let processedCount = 0;
@@ -117,4 +145,9 @@ app.post('/api/generate-leads', async (req, res) => {
 });
 
 const PORT = 3000;
-app.listen(PORT, () => console.log(`Redmun Internal Tool running on http://localhost:${PORT}`));
+app.listen(PORT, () => {
+    console.log(`\n🚀 Redmun Lead Generator running on http://localhost:${PORT}`);
+    console.log(`✅ GEMINI_API_KEY: ${process.env.GEMINI_API_KEY ? '✓ Configured' : '❌ MISSING'}`);
+    console.log(`✅ SERPAPI_KEY: ${process.env.SERPAPI_KEY ? '✓ Configured' : '❌ MISSING'}`);
+    console.log(`📖 Open your browser and navigate to http://localhost:${PORT}\n`);
+});
