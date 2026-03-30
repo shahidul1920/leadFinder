@@ -40,14 +40,26 @@ async function getTargetLeads(location, industry) {
             return [];
         }
         
-        // Loosen filters: keep anything with a site/link; ignore review count requirement
-            // Loosen review filter and accept link fallback when website missing
-            const filtered = data.local_results.filter(biz => {
+        // Loosen filters: accept Google Maps fallbacks so we don't lose leads when SerpAPI omits website
+        const filtered = data.local_results
+            .map(biz => {
                 const reviewsCount = typeof biz.reviews === 'number' ? biz.reviews : (biz.user_ratings_total || 0);
-                const hasSite = !!(biz.website || biz.link);
-                return hasSite && reviewsCount >= 0 && reviewsCount <= 2000;
+                const websiteUrl = biz.website
+                    || biz.link
+                    || (biz.links && biz.links.website)
+                    || biz.google_maps_link
+                    || biz.share_link
+                    || (biz.place_id ? `https://www.google.com/maps/place/?q=place_id:${biz.place_id}` : null)
+                    || (biz.cid ? `https://www.google.com/maps?cid=${biz.cid}` : null);
+
+                // Normalize so downstream code always has something usable
+                return { ...biz, reviewsCount, website: websiteUrl };
+            })
+            .filter(biz => {
+                const hasUrl = !!biz.website;
+                return hasUrl && biz.reviewsCount >= 0 && biz.reviewsCount <= 2000;
             });
-            console.log(`✅ Filtered results (has site/link, 0-2000 reviews): ${filtered.length}`);
+        console.log(`✅ Filtered results (has site/link/maps, 0-2000 reviews): ${filtered.length}`);
         return filtered;
     } catch (error) { 
         console.error("❌ SerpApi Error:", error.message);
@@ -130,7 +142,16 @@ app.post('/api/generate-leads', async (req, res) => {
         if (seenBrands.has(normalizedBrand) || normalizedBrand.includes('mcdonalds')) continue;
         seenBrands.add(normalizedBrand);
 
-        const websiteUrl = lead.website || lead.link || lead.canonical_page_url || 'N/A';
+        // THE FIX: Ensure the final CSV gets the right URL, with Google Maps fallback
+        const websiteUrl = lead.website
+            || lead.link
+            || (lead.links && lead.links.website)
+            || lead.google_maps_link
+            || lead.share_link
+            || (lead.place_id ? `https://www.google.com/maps/place/?q=place_id:${lead.place_id}` : null)
+            || (lead.cid ? `https://www.google.com/maps?cid=${lead.cid}` : null)
+            || lead.canonical_page_url
+            || 'N/A';
 
         const scrapeUrl = websiteUrl.startsWith('http') ? websiteUrl : null;
         const { pageText, email } = scrapeUrl ? await scrapeWebsiteData(scrapeUrl) : { pageText: '', email: 'Not Found' };
