@@ -23,11 +23,16 @@ async function getTargetLeads(location, industry) {
     console.log(`📡 SERPAPI_KEY defined: ${!!SERPAPI_KEY}`);
     
     try {
-        // THIS IS THE FIX: Using Axios instead of native fetch for better stability
         const response = await axios.get(url);
         const data = response.data;
-        
-        console.log(`✅ SerpAPI Response status: Success`);
+
+        if (data.error) {
+            // SerpAPI returns error field for invalid key/credits, surface it
+            console.error(`❌ SerpAPI error field: ${data.error}`);
+            throw new Error(data.error);
+        }
+
+        console.log(`✅ SerpAPI HTTP status: ${response.status}`);
         console.log(`📊 Local results found: ${data.local_results ? data.local_results.length : 0}`);
         
         if (!data.local_results) {
@@ -35,13 +40,22 @@ async function getTargetLeads(location, industry) {
             return [];
         }
         
-        const filtered = data.local_results.filter(biz => biz.reviews && biz.reviews >= 30 && biz.reviews <= 400 && biz.website);
-        console.log(`✅ Filtered results (30-400 reviews): ${filtered.length}`);
+        // Loosen filters: keep anything with a site/link; ignore review count requirement
+            // Loosen review filter and accept link fallback when website missing
+            const filtered = data.local_results.filter(biz => {
+                const reviewsCount = typeof biz.reviews === 'number' ? biz.reviews : (biz.user_ratings_total || 0);
+                const hasSite = !!(biz.website || biz.link);
+                return hasSite && reviewsCount >= 0 && reviewsCount <= 2000;
+            });
+            console.log(`✅ Filtered results (has site/link, 0-2000 reviews): ${filtered.length}`);
         return filtered;
     } catch (error) { 
         console.error("❌ SerpApi Error:", error.message);
-        console.error("Error response:", error.response?.data || "No response data");
-        return []; 
+        if (error.response) {
+            console.error("Status:", error.response.status);
+            console.error("Body:", error.response.data);
+        }
+        throw error; 
     }
 }
 
@@ -89,7 +103,13 @@ app.post('/api/generate-leads', async (req, res) => {
     
     fs.writeFileSync(outputFilePath, '"Business Name","Phone","Email","Website","Reviews","Vibe","Pitch Angle","Icebreaker"\n');
 
-    const leads = await getTargetLeads(location, industry);
+    let leads;
+    try {
+        leads = await getTargetLeads(location, industry);
+    } catch (err) {
+        console.error('❌ Failed to fetch leads from SerpAPI');
+        return res.status(502).json({ error: err.message || 'SerpAPI request failed' });
+    }
     
     console.log(`📋 Total leads returned from SerpAPI: ${leads.length}`);
     
@@ -110,7 +130,10 @@ app.post('/api/generate-leads', async (req, res) => {
         if (seenBrands.has(normalizedBrand) || normalizedBrand.includes('mcdonalds')) continue;
         seenBrands.add(normalizedBrand);
 
-        const { pageText, email } = await scrapeWebsiteData(lead.website);
+        const websiteUrl = lead.website || lead.link || lead.canonical_page_url || 'N/A';
+
+        const scrapeUrl = websiteUrl.startsWith('http') ? websiteUrl : null;
+        const { pageText, email } = scrapeUrl ? await scrapeWebsiteData(scrapeUrl) : { pageText: '', email: 'Not Found' };
         const strategy = await generateAgencyPitch(name, pageText);
 
         // Prepare lead data for response
@@ -118,7 +141,7 @@ app.post('/api/generate-leads', async (req, res) => {
             name,
             phone: lead.phone || 'N/A',
             email,
-            website: lead.website,
+            website: websiteUrl,
             reviews: lead.reviews,
             rating: lead.rating,
             vibe: strategy.vibe,
@@ -135,7 +158,7 @@ app.post('/api/generate-leads', async (req, res) => {
         const safeAngle = `"${strategy.angle.replace(/"/g, '""')}"`;
         const safeIcebreaker = `"${strategy.icebreaker.replace(/"/g, '""')}"`;
 
-        const csvRow = `${safeName},"${phone}","${email}","${lead.website}","${ratingStr}",${safeVibe},${safeAngle},${safeIcebreaker}\n`;
+        const csvRow = `${safeName},"${phone}","${email}","${websiteUrl}","${ratingStr}",${safeVibe},${safeAngle},${safeIcebreaker}\n`;
         fs.appendFileSync(outputFilePath, csvRow);
         processedCount++;
     }
