@@ -75,6 +75,12 @@ form {
     align-items: end;
 }
 
+.helper-text {
+    margin-top: 12px;
+    color: var(--text-light);
+    font-size: 0.95em;
+}
+
 .form-group {
     display: flex;
     flex-direction: column;

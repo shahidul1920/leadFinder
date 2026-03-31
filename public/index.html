@@ -17,13 +17,13 @@
             <section class="input-section">
                 <form id="leadForm">
                     <div class="form-group">
-                        <label for="location">📍 Location</label>
+                        <label for="country">🌍 Country (Gemini will pick cities & ZIPs)</label>
                         <input 
                             type="text" 
-                            id="location" 
-                            name="location" 
-                            placeholder="e.g., Cardiff, London, New York"
-                            value="Cardiff"
+                            id="country" 
+                            name="country" 
+                            placeholder="e.g., United Kingdom, USA, Canada"
+                            value="United Kingdom"
                             required
                         >
                     </div>
@@ -42,6 +42,7 @@
 
                     <button type="submit" id="submitBtn" class="btn-primary">Generate Leads</button>
                 </form>
+                <p class="helper-text">We will ask Gemini for up to 10 major city + ZIP/postcode pairs, then fetch ~20 leads per ZIP (guarded by free-tier limits).</p>
             </section>
 
             <section id="resultsSection" class="results-section hidden">
@@ -49,7 +50,8 @@
                     <h2>📊 Results</h2>
                     <div class="results-controls">
                         <span id="resultCount" class="result-count">0 leads found</span>
-                        <button id="downloadBtn" class="btn-secondary hidden">📥 Download CSV</button>
+                        <button id="downloadBtn" class="btn-secondary hidden">📥 Leads CSV</button>
+                        <button id="downloadLocationsBtn" class="btn-secondary hidden">📥 Searched Locations CSV</button>
                     </div>
                 </div>
 

@@ -8,22 +8,24 @@ document.addEventListener('DOMContentLoaded', () => {
     const progressText = document.getElementById('progressText');
     const resultCount = document.getElementById('resultCount');
     const downloadBtn = document.getElementById('downloadBtn');
+    const downloadLocationsBtn = document.getElementById('downloadLocationsBtn');
     const errorMessage = document.getElementById('errorMessage');
     
     let currentDownloadUrl = null;
+    let currentLocationsUrl = null;
 
     form.addEventListener('submit', async (e) => {
         e.preventDefault();
 
-        const location = document.getElementById('location').value.trim();
+        const country = document.getElementById('country').value.trim();
         const industry = document.getElementById('industry').value.trim();
 
-        if (!location || !industry) {
-            showError('Please fill in both location and industry');
+        if (!country || !industry) {
+            showError('Please fill in both country and industry');
             return;
         }
 
-        await generateLeads(location, industry);
+        await generateLeads(country, industry);
     });
 
     downloadBtn.addEventListener('click', () => {
@@ -32,7 +34,13 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     });
 
-    async function generateLeads(location, industry) {
+    downloadLocationsBtn.addEventListener('click', () => {
+        if (currentLocationsUrl) {
+            window.location.href = currentLocationsUrl;
+        }
+    });
+
+    async function generateLeads(country, industry) {
         submitBtn.disabled = true;
         submitBtn.textContent = '⏳ Generating...';
         resultsSection.classList.remove('hidden');
@@ -40,10 +48,14 @@ document.addEventListener('DOMContentLoaded', () => {
         leadsContainer.innerHTML = '';
         errorMessage.classList.add('hidden');
         downloadBtn.classList.add('hidden');
+        downloadLocationsBtn.classList.add('hidden');
+        currentDownloadUrl = null;
+        currentLocationsUrl = null;
         
         progressBar.style.width = '0%';
-        progressText.textContent = 'Starting analysis...';
+        progressText.textContent = 'Starting city & ZIP discovery...';
         let leads = [];
+        let targets = [];
 
         try {
             const response = await fetch('/api/generate-leads', {
@@ -51,7 +63,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ location, industry })
+                body: JSON.stringify({ country, industry })
             });
 
             const data = await response.json();
@@ -62,16 +74,22 @@ document.addEventListener('DOMContentLoaded', () => {
 
             if (data.leads && Array.isArray(data.leads)) {
                 leads = data.leads;
+                targets = data.targets || [];
                 displayLeads(leads);
-                resultCount.textContent = `${leads.length} lead${leads.length !== 1 ? 's' : ''} found`;
+                resultCount.textContent = `${leads.length} lead${leads.length !== 1 ? 's' : ''} found across ${targets.length || 0} locations`;
 
                 if (data.downloadUrl) {
                     currentDownloadUrl = data.downloadUrl;
                     downloadBtn.classList.remove('hidden');
                 }
 
+                if (data.locationsDownload) {
+                    currentLocationsUrl = data.locationsDownload;
+                    downloadLocationsBtn.classList.remove('hidden');
+                }
+
                 progressBar.style.width = '100%';
-                progressText.textContent = `✅ Complete! Analyzed ${leads.length} lead${leads.length !== 1 ? 's' : ''}.`;
+                progressText.textContent = `✅ Complete! Analyzed ${leads.length} lead${leads.length !== 1 ? 's' : ''} across ${targets.length || 0} areas.`;
             }
         } catch (error) {
             console.error('Error:', error);
@@ -87,7 +105,7 @@ document.addEventListener('DOMContentLoaded', () => {
         leadsContainer.innerHTML = '';
 
         if (leads.length === 0) {
-            leadsContainer.innerHTML = '<p style="text-align: center; color: var(--text-light); padding: 40px;">No leads found for this search. Try adjusting your location or industry.</p>';
+            leadsContainer.innerHTML = '<p style="text-align: center; color: var(--text-light); padding: 40px;">No leads found for this search. Try adjusting your country or industry.</p>';
             return;
         }
 
@@ -100,10 +118,12 @@ document.addEventListener('DOMContentLoaded', () => {
     function createLeadCard(lead, index) {
         const div = document.createElement('div');
         div.className = 'lead-card';
+        const rating = lead.rating ?? 'N/A';
+        const reviews = lead.reviews ?? 'N/A';
         div.innerHTML = `
             <div class="lead-header">
                 <div class="lead-name">#${index} ${escapeHtml(lead.name)}</div>
-                <div class="lead-reviews">⭐ ${lead.rating} (${lead.reviews})</div>
+                <div class="lead-reviews">⭐ ${escapeHtml(rating)} (${escapeHtml(reviews)})</div>
             </div>
 
             <div class="lead-body">
@@ -130,18 +150,23 @@ document.addEventListener('DOMContentLoaded', () => {
 
                 <div class="lead-field">
                     <div class="field-label">🎯 Vibe</div>
-                    <div class="field-value"><span class="vibe-tag">${escapeHtml(lead.vibe)}</span></div>
+                    <div class="field-value"><span class="vibe-tag">${escapeHtml(lead.vibe || 'N/A')}</span></div>
+                </div>
+
+                <div class="lead-field">
+                    <div class="field-label">🧭 Source</div>
+                    <div class="field-value">${escapeHtml(lead.sourceCity || 'N/A')} (${escapeHtml(lead.sourceZip || 'N/A')})</div>
                 </div>
             </div>
 
             <div class="lead-pitch">
-                <div class="pitch-label">💡 Pitch Angle</div>
-                <div class="pitch-text">${escapeHtml(lead.angle)}</div>
+                <div class="pitch-label">📝 Overview</div>
+                <div class="pitch-text">${escapeHtml(lead.overview || 'N/A')}</div>
             </div>
 
             <div class="lead-pitch" style="margin-top: 15px;">
                 <div class="pitch-label">💬 Icebreaker</div>
-                <div class="pitch-text">${escapeHtml(lead.icebreaker)}</div>
+                <div class="pitch-text">${escapeHtml(lead.icebreaker || 'N/A')}</div>
             </div>
         `;
         return div;
@@ -153,6 +178,7 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     function escapeHtml(text) {
+        if (text === null || text === undefined) return '';
         const map = {
             '&': '&amp;',
             '<': '&lt;',
@@ -160,6 +186,6 @@ document.addEventListener('DOMContentLoaded', () => {
             '"': '&quot;',
             "'": '&#039;'
         };
-        return text.replace(/[&<>"']/g, m => map[m]);
+        return text.toString().replace(/[&<>"']/g, m => map[m]);
     }
 });
