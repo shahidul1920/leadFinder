@@ -19,6 +19,64 @@ const MAX_TARGETS = 10; // cap city/ZIP targets from Gemini
 const MAX_PER_ZIP = 20; // per ZIP/area lead cap
 const MAX_TOTAL_LEADS = 200; // global guardrail for free-tier limits
 
+function normalizeUrl(url) {
+    if (!url || typeof url !== 'string') return null;
+    const trimmed = url.trim();
+    if (!trimmed) return null;
+    if (/^https?:\/\//i.test(trimmed)) return trimmed;
+    if (/^(mailto:|tel:|javascript:)/i.test(trimmed)) return null;
+    return `https://${trimmed}`;
+}
+
+function isGoogleDomain(url) {
+    if (!url || typeof url !== 'string') return false;
+    try {
+        const parsed = new URL(normalizeUrl(url));
+        return /(^|\.)google\./i.test(parsed.hostname);
+    } catch {
+        return false;
+    }
+}
+
+function extractEmailsFromHtml(html) {
+    if (!html || typeof html !== 'string') return [];
+
+    const directMatches = html.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g) || [];
+    const mailtoMatches = Array.from(html.matchAll(/mailto:([^"'\s>]+)/gi)).map(m => m[1]);
+    const obfuscated = html.match(/[a-zA-Z0-9._%+-]+\s*(?:\[at\]|\(at\)|\sat\s)\s*[a-zA-Z0-9.-]+\s*(?:\[dot\]|\(dot\)|\sdot\s)\s*[a-zA-Z]{2,}/gi) || [];
+
+    const decodedObfuscated = obfuscated.map(item =>
+        item
+            .replace(/\s*(\[at\]|\(at\)|\sat\s)\s*/gi, '@')
+            .replace(/\s*(\[dot\]|\(dot\)|\sdot\s)\s*/gi, '.')
+            .replace(/\s+/g, '')
+    );
+
+    return [...directMatches, ...mailtoMatches, ...decodedObfuscated]
+        .map(e => e.trim().toLowerCase())
+        .filter(e => /@/.test(e) && /\.[a-z]{2,}$/i.test(e))
+        .filter(e => !/\.(png|jpg|jpeg|gif|webp|svg)$/i.test(e));
+}
+
+function pickBestEmail(emails) {
+    if (!Array.isArray(emails) || emails.length === 0) return 'Not Found';
+    const blacklist = ['example.com', 'email.com', 'domain.com', 'sentry.io'];
+    const cleaned = [...new Set(emails)].filter(e => !blacklist.some(b => e.includes(b)));
+    return cleaned[0] || 'Not Found';
+}
+
+async function getPlaceDetails(placeId) {
+    if (!placeId) return null;
+    const url = `https://serpapi.com/search.json?engine=google_maps_place&place_id=${encodeURIComponent(placeId)}&api_key=${SERPAPI_KEY}`;
+    try {
+        const response = await axios.get(url, { timeout: 8000 });
+        return response.data?.place_results || null;
+    } catch (error) {
+        console.error(`⚠️ Place details lookup failed for place_id=${placeId}: ${error.message}`);
+        return null;
+    }
+}
+
 async function getTargetLeads({ country, city, zip, industry }) {
     const locationParts = [city, zip, country].filter(Boolean).join(' ');
     const query = `${industry} in ${locationParts}`;
@@ -49,13 +107,15 @@ async function getTargetLeads({ country, city, zip, industry }) {
         const filtered = data.local_results
             .map(biz => {
                 const reviewsCount = typeof biz.reviews === 'number' ? biz.reviews : (biz.user_ratings_total || 0);
-                const websiteUrl = biz.website
+                const websiteUrl = normalizeUrl(
+                    biz.website
                     || biz.link
                     || (biz.links && biz.links.website)
                     || biz.google_maps_link
                     || biz.share_link
                     || (biz.place_id ? `https://www.google.com/maps/place/?q=place_id:${biz.place_id}` : null)
-                    || (biz.cid ? `https://www.google.com/maps?cid=${biz.cid}` : null);
+                    || (biz.cid ? `https://www.google.com/maps?cid=${biz.cid}` : null)
+                );
 
                 // Normalize so downstream code always has something usable
                 return { ...biz, reviewsCount, website: websiteUrl };
@@ -78,16 +138,46 @@ async function getTargetLeads({ country, city, zip, industry }) {
 
 async function scrapeWebsiteData(url) {
     try {
-        const { data } = await axios.get(url, { timeout: 7000 });
+        const normalized = normalizeUrl(url);
+        if (!normalized) return { pageText: '', email: 'Not Found' };
+
+        const { data } = await axios.get(normalized, {
+            timeout: 9000,
+            maxRedirects: 5,
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+            }
+        });
+
         const $ = cheerio.load(data);
-        let pageText = $('body').text().replace(/\s+/g, ' ').trim().substring(0, 3000);
-        
-        let email = 'Not Found';
-        const extractedEmails = data.match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/gi);
-        if (extractedEmails) {
-            const validEmails = extractedEmails.filter(e => !e.endsWith('.png') && !e.endsWith('.jpg'));
-            if (validEmails.length > 0) email = validEmails[0];
+        const pageText = $('body').text().replace(/\s+/g, ' ').trim().substring(0, 3000);
+
+        let foundEmails = extractEmailsFromHtml(data);
+
+        // Fallback: crawl one likely contact page on the same site when homepage has no email.
+        if (foundEmails.length === 0) {
+            const contactHref = $('a[href]').toArray()
+                .map(el => $(el).attr('href'))
+                .find(href => href && /(contact|about|support|get-in-touch|impressum)/i.test(href));
+
+            if (contactHref) {
+                try {
+                    const contactUrl = new URL(contactHref, normalized).toString();
+                    const { data: contactHtml } = await axios.get(contactUrl, {
+                        timeout: 7000,
+                        maxRedirects: 5,
+                        headers: {
+                            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
+                        }
+                    });
+                    foundEmails = extractEmailsFromHtml(contactHtml);
+                } catch {
+                    // Ignore contact-page fetch errors and keep Not Found fallback.
+                }
+            }
         }
+
+        const email = pickBestEmail(foundEmails);
         return { pageText, email };
     } catch (error) { return { pageText: '', email: 'Not Found' }; }
 }
@@ -190,17 +280,40 @@ app.post('/api/generate-leads', async (req, res) => {
             if (seenBrands.has(normalizedBrand) || normalizedBrand.includes('mcdonalds')) continue;
             seenBrands.add(normalizedBrand);
 
-            const websiteUrl = lead.website
-                || lead.link
-                || (lead.links && lead.links.website)
-                || lead.google_maps_link
+            const mapsFallback = normalizeUrl(
+                lead.google_maps_link
                 || lead.share_link
                 || (lead.place_id ? `https://www.google.com/maps/place/?q=place_id:${lead.place_id}` : null)
                 || (lead.cid ? `https://www.google.com/maps?cid=${lead.cid}` : null)
-                || lead.canonical_page_url
-                || 'N/A';
+            );
 
-            const scrapeUrl = websiteUrl.startsWith('http') ? websiteUrl : null;
+            let websiteUrl = normalizeUrl(
+                lead.website
+                || lead.link
+                || (lead.links && lead.links.website)
+                || lead.canonical_page_url
+            );
+
+            // If the only URL is a Google URL, request place details and try to recover the business website.
+            if ((!websiteUrl || isGoogleDomain(websiteUrl)) && lead.place_id) {
+                const placeDetails = await getPlaceDetails(lead.place_id);
+                const detailWebsite = normalizeUrl(
+                    placeDetails?.website
+                    || placeDetails?.link
+                    || placeDetails?.url
+                );
+                if (detailWebsite && !isGoogleDomain(detailWebsite)) {
+                    websiteUrl = detailWebsite;
+                }
+            }
+
+            if (!websiteUrl && mapsFallback) {
+                websiteUrl = mapsFallback;
+            }
+
+            const finalWebsite = websiteUrl || 'N/A';
+
+            const scrapeUrl = finalWebsite !== 'N/A' ? normalizeUrl(finalWebsite) : null;
             const { pageText, email } = scrapeUrl ? await scrapeWebsiteData(scrapeUrl) : { pageText: '', email: 'Not Found' };
             const strategy = await generateAgencyPitch(name, pageText);
 
@@ -208,7 +321,7 @@ app.post('/api/generate-leads', async (req, res) => {
                 name,
                 phone: lead.phone || 'N/A',
                 email,
-                website: websiteUrl,
+                website: finalWebsite,
                 reviews: lead.reviews,
                 rating: lead.rating,
                 vibe: strategy.vibe,
@@ -228,7 +341,7 @@ app.post('/api/generate-leads', async (req, res) => {
             const safeCity = `"${target.city.replace(/"/g, '""')}"`;
             const safeZip = `"${(target.zip || 'N/A').replace(/"/g, '""')}"`;
 
-            const csvRow = `${safeName},"${phone}","${email}","${websiteUrl}","${ratingStr}",${safeVibe},${safeOverview},${safeIcebreaker},${safeCity},${safeZip}\n`;
+            const csvRow = `${safeName},"${phone}","${email}","${finalWebsite}","${ratingStr}",${safeVibe},${safeOverview},${safeIcebreaker},${safeCity},${safeZip}\n`;
             fs.appendFileSync(outputFilePath, csvRow);
 
             processedCount++;

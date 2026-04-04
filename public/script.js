@@ -144,7 +144,9 @@ document.addEventListener('DOMContentLoaded', () => {
                 <div class="lead-field">
                     <div class="field-label">🌐 Website</div>
                     <div class="field-value">
-                        <a href="${escapeHtml(lead.website)}" target="_blank" rel="noopener noreferrer">Visit →</a>
+                        ${lead.website && lead.website !== 'N/A'
+                            ? `<a href="${escapeHtml(lead.website)}" target="_blank" rel="noopener noreferrer">Visit →</a>`
+                            : '❌ Not Found'}
                     </div>
                 </div>
 
