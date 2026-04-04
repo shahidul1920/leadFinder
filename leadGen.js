@@ -65,20 +65,25 @@ function pickBestEmail(emails) {
     return cleaned[0] || 'Not Found';
 }
 
-async function getPlaceDetails(placeId) {
-    if (!placeId) return null;
-    const url = `https://serpapi.com/search.json?engine=google_maps_place&place_id=${encodeURIComponent(placeId)}&api_key=${SERPAPI_KEY}`;
+async function getPlaceDetails({ title, address }) {
+    const query = [title, address].filter(Boolean).join(' ').trim();
+    if (!query) return null;
+    const url = `https://serpapi.com/search.json?engine=google_maps&q=${encodeURIComponent(query)}&api_key=${SERPAPI_KEY}`;
     try {
         const response = await axios.get(url, { timeout: 8000 });
+        if (response.data?.error) return null;
         return response.data?.place_results || null;
     } catch (error) {
-        console.error(`⚠️ Place details lookup failed for place_id=${placeId}: ${error.message}`);
+        console.error(`⚠️ Place details lookup failed for "${title || 'unknown'}": ${error.message}`);
         return null;
     }
 }
 
 async function getTargetLeads({ country, city, zip, industry }) {
-    const locationParts = [city, zip, country].filter(Boolean).join(' ');
+    const locationParts = [...new Set([city, zip, country].filter(Boolean).map(part => part.toString().trim().toLowerCase()))]
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
     const query = `${industry} in ${locationParts}`;
     const url = `https://serpapi.com/search.json?engine=google_local&q=${encodeURIComponent(query)}&api_key=${SERPAPI_KEY}`;
     
@@ -295,8 +300,8 @@ app.post('/api/generate-leads', async (req, res) => {
             );
 
             // If the only URL is a Google URL, request place details and try to recover the business website.
-            if ((!websiteUrl || isGoogleDomain(websiteUrl)) && lead.place_id) {
-                const placeDetails = await getPlaceDetails(lead.place_id);
+            if (!websiteUrl || isGoogleDomain(websiteUrl)) {
+                const placeDetails = await getPlaceDetails({ title: name, address: lead.address });
                 const detailWebsite = normalizeUrl(
                     placeDetails?.website
                     || placeDetails?.link
