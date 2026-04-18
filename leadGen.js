@@ -13,6 +13,7 @@ const MAX_TOTAL_LEADS = 200;
 const MIN_REQUIRED_LEADS = 10;
 
 // --- Core Helper Functions ---
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
 function normalizeLead(candidate) {
     const asString = (value, fallback = 'Not Found') => {
@@ -38,11 +39,43 @@ function normalizeLead(candidate) {
     };
 }
 
-// Gemini-first lead researcher with Google Search grounding.
-async function generateGroundedLeads(country, industry) {
-    // Make sure you imported SchemaType at the top of your file:
-    // const { GoogleGenerativeAI, SchemaType } = require('@google/generative-ai');
+// Helper to generate a chunking list first
+async function generateCityZipList(country) {
+    const schema = {
+        type: SchemaType.ARRAY,
+        items: {
+            type: SchemaType.OBJECT,
+            properties: {
+                city: { type: SchemaType.STRING },
+                zip: { type: SchemaType.STRING }
+            },
+            required: ["city", "zip"]
+        }
+    };
 
+    const model = genAI.getGenerativeModel({
+        model: 'gemini-2.5-flash',
+        generationConfig: {
+            responseMimeType: "application/json",
+            responseSchema: schema,
+        }
+    });
+
+    const prompt = `Return a JSON array of exactly 5 major cities and representative ZIP codes for the country: ${country}. Format: [{"city": "City Name", "zip": "ZIP/Postal Code"}]`;
+
+    try {
+        const result = await model.generateContent(prompt);
+        const parsed = JSON.parse(result.response.text());
+        return Array.isArray(parsed) ? parsed.slice(0, 5) : [];
+    } catch (e) {
+        console.error("❌ Failed to generate city/zip list:", e.message);
+        return [];
+    }
+}
+
+// Gemini-first lead researcher with Google Search grounding.
+// Gemini-first lead researcher with Google Search grounding.
+async function generateGroundedLeads(city, zip, country, industry) {
     const schema = {
         type: SchemaType.ARRAY,
         description: "A list of generated business leads.",
@@ -61,52 +94,46 @@ async function generateGroundedLeads(country, industry) {
                 sourceCity: { type: SchemaType.STRING },
                 sourceZip: { type: SchemaType.STRING }
             },
-            // The API requires you to list all properties here to enforce the structure
             required: [
                 "name", "phone", "email", "website", "rating",
                 "reviews", "vibe", "overview", "icebreaker",
                 "sourceCity", "sourceZip"
             ]
-            // CRITICAL: Make sure there is NO `additionalProperties` key here.
         }
     };
 
     const model = genAI.getGenerativeModel({
         model: 'gemini-2.5-flash',
-        tools: [{ googleSearch: {} }]
+        tools: [{ googleSearch: {} }],
+        // CRITICAL FIX: Forcing JSON output directly stops the markdown backticks
+        generationConfig: {
+            responseMimeType: "application/json",
+            responseSchema: schema,
+        }
     });
 
     const prompt = `You are an expert web researcher for B2B lead generation.
-Find real businesses in ${country} for the industry: ${industry}.
+Find exactly 25 real businesses in ${city}, ${zip}, ${country} for the industry: ${industry}.
 
 Requirements:
 1) Use web search to discover and verify real local businesses.
-2) Return at least ${MIN_REQUIRED_LEADS} unique businesses.
-3) Each object must include exact keys only: name, phone, email, website, rating, reviews, vibe, overview, icebreaker, sourceCity, sourceZip.
+2) Return exactly 25 unique businesses.
+3) Each object must include exact keys only.
 4) phone/email/website must be real if available; otherwise return "Not Found".
 5) rating must be a string like "4.5". reviews must be an integer.
 6) vibe must be 2-3 words.
 7) overview must be exactly 2 sentences describing online presence.
 8) icebreaker must be exactly 2 sentences, personalized as a cold outreach opener.
-9) sourceCity and sourceZip must correspond to where the business operates.
-10) Return strict JSON array only. No markdown, no explanations. Just [\n { ... } \n]`;
+9) sourceCity and sourceZip must correspond to where the business operates.`;
 
     const result = await model.generateContent(prompt);
-    let rawText = result.response.text().trim();
-    if (rawText.startsWith('```')) {
-        const lines = rawText.split('\\n');
-        if (lines[0].startsWith('```')) lines.shift();
-        if (lines[lines.length - 1].startsWith('```')) lines.pop();
-        rawText = lines.join('\\n').trim();
-    }
+    
+    // Because we forced JSON MIME type, we don't need the brittle replace/split logic anymore
+    const rawText = result.response.text().trim();
     const parsed = JSON.parse(rawText);
 
     if (!Array.isArray(parsed)) {
         throw new Error('Gemini response was not a JSON array.');
-    }
-
-    if (parsed.length < MIN_REQUIRED_LEADS) {
-        throw new Error(`Gemini returned fewer than ${MIN_REQUIRED_LEADS} leads.`);
     }
 
     return parsed;
@@ -127,27 +154,44 @@ app.post('/api/generate-leads', async (req, res) => {
         return res.status(500).json({ error: 'Missing GEMINI_API_KEY in environment variables.' });
     }
 
-    let aiLeads = [];
-    try {
-        aiLeads = await generateGroundedLeads(country, industry);
-    } catch (error) {
-        console.error('❌ Gemini lead generation failed:', error.message);
-        return res.status(502).json({ error: 'Failed to generate grounded leads from Gemini.' });
+    let cityZipList = await generateCityZipList(country);
+    if (!cityZipList || cityZipList.length === 0) {
+        cityZipList = [{ city: country, zip: '' }];
     }
 
     const seenBrands = new Set();
     const processedLeads = [];
 
-    for (const candidate of aiLeads) {
+    let isFirstChunk = true;
+
+    for (const target of cityZipList) {
         if (processedLeads.length >= MAX_TOTAL_LEADS) break;
 
-        const normalized = normalizeLead(candidate);
-        const normalizedBrand = normalized.name.toLowerCase().split(/[-|()]/)[0].trim();
+        if (!isFirstChunk) {
+            console.log(`⏳ Waiting 15 seconds to respect Gemini API rate limits...`);
+            await delay(15000);
+        }
+        isFirstChunk = false;
 
-        if (!normalizedBrand || seenBrands.has(normalizedBrand) || normalizedBrand.includes('mcdonalds')) continue;
+        console.log(`🤖 Prospecting chunk: ${target.city}, ${target.zip} ...`);
 
-        seenBrands.add(normalizedBrand);
-        processedLeads.push(normalized);
+        try {
+            const aiLeads = await generateGroundedLeads(target.city, target.zip, country, industry);
+            for (const candidate of aiLeads) {
+                if (processedLeads.length >= MAX_TOTAL_LEADS) break;
+
+                const normalized = normalizeLead(candidate);
+                const normalizedBrand = normalized.name.toLowerCase().split(/[-|()]/)[0].trim();
+
+                if (!normalizedBrand || seenBrands.has(normalizedBrand) || normalizedBrand.includes('mcdonalds')) continue;
+
+                seenBrands.add(normalizedBrand);
+                processedLeads.push(normalized);
+            }
+        } catch (error) {
+            console.error(`❌ Gemini lead generation failed for ${target.city}:`, error.message);
+            // Continue onto the next target chunk without failing the whole request
+        }
     }
 
     if (processedLeads.length === 0) return res.status(404).json({ error: 'No leads found.' });
