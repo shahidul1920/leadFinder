@@ -2,6 +2,8 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
+const axios = require('axios');
+const cheerio = require('cheerio');
 const { GoogleGenerativeAI, SchemaType } = require('@google/generative-ai');
 
 const app = express();
@@ -9,8 +11,9 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
+const SERPAPI_KEY = process.env.SERPAPI_KEY;
 const MAX_TOTAL_LEADS = 200;
-const MIN_REQUIRED_LEADS = 10;
+const MAX_PER_ZIP = 20;
 
 // --- Core Helper Functions ---
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
@@ -54,7 +57,7 @@ async function generateCityZipList(country) {
     };
 
     const model = genAI.getGenerativeModel({
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.1-flash-lite-preview',
         generationConfig: {
             responseMimeType: "application/json",
             responseSchema: schema,
@@ -74,69 +77,86 @@ async function generateCityZipList(country) {
 }
 
 // Gemini-first lead researcher with Google Search grounding.
-// Gemini-first lead researcher with Google Search grounding.
-async function generateGroundedLeads(city, zip, country, industry) {
+async function getTargetLeads({ country, city, zip, industry }) {
+    const locationParts = [...new Set([city, zip, country].filter(Boolean).map(part => String(part).trim().toLowerCase()))]
+        .join(' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+    const query = `${industry} in ${locationParts}`;
+    const url = `https://serpapi.com/search.json?engine=google_local&q=${encodeURIComponent(query)}&api_key=${SERPAPI_KEY}`;
+    
+    console.log(`🔍 Discovery Phase: Searching for "${query}"`);
+    
+    try {
+        const response = await axios.get(url);
+        const data = response.data;
+
+        if (data.error) throw new Error(data.error);
+        if (!data.local_results) return [];
+        
+        return data.local_results.filter(biz => {
+            const reviewsCount = typeof biz.reviews === 'number' ? biz.reviews : (biz.user_ratings_total || 0);
+            return reviewsCount >= 0 && reviewsCount <= 2000; // E.g., not massive corporations setup
+        });
+    } catch (error) { 
+        console.error("❌ SerpApi Error:", error.message);
+        throw error; 
+    }
+}
+
+async function scrapeWebsiteData(url) {
+    if (!url) return { text: '', email: null };
+    try {
+        const response = await axios.get(url, { timeout: 10000 });
+        const html = response.data;
+        const $ = cheerio.load(html);
+        
+        $('script, style, noscript').remove();
+        const text = $('body').text().replace(/\s+/g, ' ').trim().substring(0, 3000); // 3000 chars should be plenty context
+        
+        const emailMatch = html.match(/([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+\.[a-zA-Z0-9_-]+)/);
+        const email = emailMatch ? emailMatch[0] : null;
+
+        return { text, email };
+    } catch (error) {
+        return { text: '', email: null };
+    }
+}
+
+async function generateAgencyPitch(businessName, websiteText) {
     const schema = {
-        type: SchemaType.ARRAY,
-        description: "A list of generated business leads.",
-        items: {
-            type: SchemaType.OBJECT,
-            properties: {
-                name: { type: SchemaType.STRING, description: "Business name" },
-                phone: { type: SchemaType.STRING, description: "Contact phone number or 'N/A'" },
-                email: { type: SchemaType.STRING, description: "Contact email or 'Not Found'" },
-                website: { type: SchemaType.STRING, description: "Website URL or 'Not Found'" },
-                rating: { type: SchemaType.STRING, description: "Star rating, e.g., '4.5'" },
-                reviews: { type: SchemaType.INTEGER, description: "Number of reviews" },
-                vibe: { type: SchemaType.STRING, description: "2-3 word vibe description" },
-                overview: { type: SchemaType.STRING, description: "2 sentence overview" },
-                icebreaker: { type: SchemaType.STRING, description: "2 sentence cold outreach icebreaker" },
-                sourceCity: { type: SchemaType.STRING },
-                sourceZip: { type: SchemaType.STRING }
-            },
-            required: [
-                "name", "phone", "email", "website", "rating",
-                "reviews", "vibe", "overview", "icebreaker",
-                "sourceCity", "sourceZip"
-            ]
-        }
+        type: SchemaType.OBJECT,
+        properties: {
+            vibe: { type: SchemaType.STRING, description: "2-3 word vibe description" },
+            overview: { type: SchemaType.STRING, description: "2 sentence overview of their business based on website text" },
+            icebreaker: { type: SchemaType.STRING, description: "2 sentence personalized agency cold outreach pitch" }
+        },
+        required: ["vibe", "overview", "icebreaker"]
     };
 
     const model = genAI.getGenerativeModel({
-        model: 'gemini-2.5-flash',
-        tools: [{ googleSearch: {} }],
-        // CRITICAL FIX: Forcing JSON output directly stops the markdown backticks
+        model: 'gemini-3.1-flash-lite-preview',
         generationConfig: {
             responseMimeType: "application/json",
             responseSchema: schema,
         }
     });
 
-    const prompt = `You are an expert web researcher for B2B lead generation.
-Find exactly 25 real businesses in ${city}, ${zip}, ${country} for the industry: ${industry}.
+    const prompt = `You are a B2B sales development representative pitching an agency service to: "${businessName}".
+Here is some extracted text from their website:
+"""
+${websiteText || 'No website text available.'}
+"""
 
-Requirements:
-1) Use web search to discover and verify real local businesses.
-2) Return exactly 25 unique businesses.
-3) Each object must include exact keys only.
-4) phone/email/website must be real if available; otherwise return "Not Found".
-5) rating must be a string like "4.5". reviews must be an integer.
-6) vibe must be 2-3 words.
-7) overview must be exactly 2 sentences describing online presence.
-8) icebreaker must be exactly 2 sentences, personalized as a cold outreach opener.
-9) sourceCity and sourceZip must correspond to where the business operates.`;
+Based on this, return a JSON object evaluating their brand. Include a 2-sentence overview acknowledging what they do well or what they lack. Then, generate a cold outreach icebreaker (2 sentences) uniquely tied to their business that transitions into a standard web agency pitch.`;
 
-    const result = await model.generateContent(prompt);
-    
-    // Because we forced JSON MIME type, we don't need the brittle replace/split logic anymore
-    const rawText = result.response.text().trim();
-    const parsed = JSON.parse(rawText);
-
-    if (!Array.isArray(parsed)) {
-        throw new Error('Gemini response was not a JSON array.');
+    try {
+        const result = await model.generateContent(prompt);
+        return JSON.parse(result.response.text());
+    } catch (error) {
+        console.error(`⚠️ Pitch generation failed for ${businessName}:`, error.message);
+        return null;
     }
-
-    return parsed;
 }
 
 // --- The Main API Endpoint ---
@@ -162,35 +182,48 @@ app.post('/api/generate-leads', async (req, res) => {
     const seenBrands = new Set();
     const processedLeads = [];
 
-    let isFirstChunk = true;
-
     for (const target of cityZipList) {
         if (processedLeads.length >= MAX_TOTAL_LEADS) break;
 
-        if (!isFirstChunk) {
-            console.log(`⏳ Waiting 15 seconds to respect Gemini API rate limits...`);
-            await delay(15000);
-        }
-        isFirstChunk = false;
-
-        console.log(`🤖 Prospecting chunk: ${target.city}, ${target.zip} ...`);
-
+        let leadsForTarget = [];
         try {
-            const aiLeads = await generateGroundedLeads(target.city, target.zip, country, industry);
-            for (const candidate of aiLeads) {
-                if (processedLeads.length >= MAX_TOTAL_LEADS) break;
+            leadsForTarget = await getTargetLeads({ country, city: target.city, zip: target.zip, industry });
+            console.log(`🤖 Prospecting chunk: ${target.city}, ${target.zip} -> Found ${leadsForTarget.length} raw leads`);
+        } catch (err) { continue; }
 
-                const normalized = normalizeLead(candidate);
-                const normalizedBrand = normalized.name.toLowerCase().split(/[-|()]/)[0].trim();
+        let perZipCount = 0;
+        for (const lead of leadsForTarget) {
+            if (processedLeads.length >= MAX_TOTAL_LEADS || perZipCount >= MAX_PER_ZIP) break;
 
-                if (!normalizedBrand || seenBrands.has(normalizedBrand) || normalizedBrand.includes('mcdonalds')) continue;
+            const name = lead.title || 'N/A';
+            const normalizedBrand = name.toLowerCase().split(/[-|()]/)[0].trim();
 
-                seenBrands.add(normalizedBrand);
-                processedLeads.push(normalized);
-            }
-        } catch (error) {
-            console.error(`❌ Gemini lead generation failed for ${target.city}:`, error.message);
-            // Continue onto the next target chunk without failing the whole request
+            if (!normalizedBrand || seenBrands.has(normalizedBrand) || normalizedBrand.includes('mcdonalds')) continue;
+            seenBrands.add(normalizedBrand);
+
+            console.log(`   - Scraping/Pitching: ${name}`);
+            const siteData = await scrapeWebsiteData(lead.website);
+            const aiData = await generateAgencyPitch(name, siteData.text);
+
+            // Add an artificial processing delay to respect Gemini's 15 RPM Free Tier quota
+            await delay(4500);
+
+            const normalizedLead = normalizeLead({
+                name,
+                phone: lead.phone || 'N/A',
+                email: siteData.email || 'Not Found',
+                website: lead.website || 'N/A',
+                reviews: lead.reviews,
+                rating: lead.rating,
+                vibe: aiData?.vibe || 'N/A',
+                overview: aiData?.overview || 'N/A',
+                icebreaker: aiData?.icebreaker || 'N/A',
+                sourceCity: target.city,
+                sourceZip: target.zip || 'N/A'
+            });
+
+            processedLeads.push(normalizedLead);
+            perZipCount++;
         }
     }
 
